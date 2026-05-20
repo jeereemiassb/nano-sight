@@ -21,4 +21,6 @@
   <uses-permission android:name="horizonos.permission.HEADSET_CAMERA" />
   <!-- Required by NanoSight FaceID: FaceServerClient POSTs the cropped face to the identification server. -->
   <uses-permission android:name="android.permission.INTERNET" />
+  <!-- Required for the Quest system overlay keyboard to appear when a TMP_InputField gets focus. -->
+  <uses-feature android:name="oculus.software.overlay_keyboard" android:required="false" />
 </manifest>

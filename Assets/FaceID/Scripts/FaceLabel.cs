@@ -40,6 +40,64 @@ namespace NanoSight.FaceID
         [Tooltip("Duration of the fade-in (Show) and fade-out (Hide) animations, in seconds.")]
         [SerializeField, Range(0f, 2f)] private float m_fadeDuration = 0.35f;
 
+        [Header("Text sizes")]
+        [Tooltip("Font size del nombre (TMP en world space). 16-22 suele quedar bien para Quest.")]
+        [SerializeField, Range(8f, 60f)] private float m_nameFontSize = 18f;
+
+        [Tooltip("Font size del texto secundario (confidence + tipo + status + …). Más pequeño que el nombre.")]
+        [SerializeField, Range(6f, 40f)] private float m_detailsFontSize = 11f;
+
+        [Header("Distance scaling")]
+        [Tooltip("Escala el panel según la distancia a la cámara para que ocupe el mismo área " +
+                 "visual a cualquier distancia (a más lejos, panel más grande en world, mismo " +
+                 "tamaño aparente en pantalla). Desactiva si prefieres tamaño mundo fijo.")]
+        [SerializeField] private bool m_scaleByDistance = true;
+
+        [Tooltip("Distancia de referencia (m) a la que el panel tiene su escala original (1x). " +
+                 "A 2x esta distancia el panel será 2x más grande en world, etc.")]
+        [SerializeField, Range(0.3f, 5f)] private float m_referenceDistance = 1.0f;
+
+        [Tooltip("Clamp mínimo / máximo de la escala aplicada para evitar paneles invisibles o " +
+                 "monstruosos en distancias extremas.")]
+        [SerializeField] private Vector2 m_scaleRange = new Vector2(0.3f, 3f);
+
+        private Vector3 m_baseLocalScale = Vector3.one;
+
+        // ---- Runtime knobs (driven by the in-VR options menu via FaceLabelManager) ----
+        public float NameFontSize
+        {
+            get => m_nameFontSize;
+            set
+            {
+                m_nameFontSize = value;
+                if (m_nameText != null) m_nameText.fontSize = value;
+            }
+        }
+        public float DetailsFontSize
+        {
+            get => m_detailsFontSize;
+            set
+            {
+                m_detailsFontSize = value;
+                if (m_confidenceText != null) m_confidenceText.fontSize = value;
+            }
+        }
+        public float ReferenceDistance
+        {
+            get => m_referenceDistance;
+            set => m_referenceDistance = Mathf.Max(0.01f, value);
+        }
+        public bool ScaleByDistance
+        {
+            get => m_scaleByDistance;
+            set => m_scaleByDistance = value;
+        }
+        public float PanelScale
+        {
+            get => m_baseLocalScale.x;
+            set => m_baseLocalScale = Vector3.one * Mathf.Max(0.01f, value);
+        }
+
         private Transform m_cameraTransform;
         private Vector3 m_targetPosition;
         private bool m_hasTarget;
@@ -57,6 +115,7 @@ namespace NanoSight.FaceID
             if (m_canvasGroup == null)
                 m_canvasGroup = GetComponent<CanvasGroup>();
             m_canvasGroup.alpha = 0f;
+            m_baseLocalScale = transform.localScale;
         }
 
         /// <summary>Injects the camera the panel should follow / face. Falls back to Camera.main when never set.</summary>
@@ -102,15 +161,29 @@ namespace NanoSight.FaceID
             }
         }
 
-        /// <summary>Fills the panel texts and fades it in. Position comes from <see cref="SetTarget"/>.</summary>
-        public void Show(string displayName, float confidence)
+        /// <summary>
+        /// Fills the panel texts and fades it in. <paramref name="infoText"/> is the server-
+        /// composed multi-line description (rendered verbatim, TMP rich-text honoured); the
+        /// confidence % is always appended in cyan at the bottom.
+        /// </summary>
+        public void Show(string displayName, float confidence, string infoText = null)
         {
             gameObject.SetActive(true);
 
             if (m_nameText != null)
+            {
                 m_nameText.text = string.IsNullOrEmpty(displayName) ? "—" : displayName;
+                m_nameText.fontSize = m_nameFontSize;
+            }
+
             if (m_confidenceText != null)
-                m_confidenceText.text = $"{Mathf.RoundToInt(Mathf.Clamp01(confidence) * 100f)}%";
+            {
+                m_confidenceText.fontSize = m_detailsFontSize;
+                var pct = $"<color=#5FE8C5>{Mathf.RoundToInt(Mathf.Clamp01(confidence) * 100f)}%</color>";
+                m_confidenceText.text = string.IsNullOrWhiteSpace(infoText)
+                    ? pct
+                    : $"{infoText.TrimEnd()}\n{pct}";
+            }
 
             StartFade(1f, deactivateWhenDone: false);
         }
@@ -162,6 +235,23 @@ namespace NanoSight.FaceID
             transform.position = Vector3.Lerp(transform.position, desired, t);
             if (m_billboard)
                 ApplyBillboard();
+            ApplyDistanceScale();
+        }
+
+        /// <summary>
+        /// Scales the panel by (distance_to_camera / reference) so its apparent on-screen size
+        /// stays roughly constant as the user moves nearer/farther from the labelled face.
+        /// </summary>
+        private void ApplyDistanceScale()
+        {
+            if (!m_scaleByDistance) return;
+            var cam = ResolveCamera();
+            if (cam == null) return;
+
+            var distance = Vector3.Distance(transform.position, cam.position);
+            var s = Mathf.Clamp(distance / Mathf.Max(0.01f, m_referenceDistance),
+                                m_scaleRange.x, m_scaleRange.y);
+            transform.localScale = m_baseLocalScale * s;
         }
 
         /// <summary>Target face position plus the camera-relative offset (right / up / forward).</summary>

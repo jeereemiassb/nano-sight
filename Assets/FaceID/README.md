@@ -22,6 +22,8 @@ los samples que no se usan; solo se conservan `CameraToWorld` y el core de `Pass
 | `Scripts/FaceLabel.cs` | Panel flotante: `Show()`/`Hide()` con fade, billboard, posición lerpeada con offset. |
 | `Scripts/FaceLabelManager.cs` | Pool de labels, mapping `trackId → label`, dedup, limpieza de caras desaparecidas. |
 | `Scripts/FaceBoxMarker.cs` | Cuadrado 3D (`LineRenderer`) que se pega a la cara y la sigue suavemente. Lo crea `FaceIdentifier` por código, sin prefab. |
+| `Scripts/ServerRequestLog.cs` | Ring buffer estático (50 entradas) de cada petición al servidor: estado (OK / desconocido / error), nombre, confianza, latencia. Lo alimenta `FaceIdentifier` y lo consume `WristLogMenu`. |
+| `Scripts/WristLogMenu.cs` | Panel flotante atado a la muñeca (`LeftHandAnchor` por defecto): se hace visible cuando el dorso de la muñeca apunta hacia los ojos y muestra el log de peticiones. Code-spawnea su Canvas/Image/TMP, sin prefab. |
 | `Scenes/FaceID.unity` | Escena de trabajo (duplicado de `CameraToWorld.unity`). |
 | `Prefabs/FaceLabel.prefab` | Canvas World Space 30×20 cm, fondo redondeado, dos `TextMeshProUGUI`, script `FaceLabel` attacheado. |
 | `Models/yunet.onnx` | Modelo YuNet (OpenCV Model Zoo, `face_detection_yunet_2023mar`, MIT). |
@@ -63,8 +65,11 @@ por defecto. Sin esto, el texto de los labels no se renderiza (el panel oscuro s
 ### 3.2. Limpiar la escena (si abres por primera vez después de la limpieza del repo)
 Tras borrar los assets zombies del sample, Unity puede dejar 2 GameObjects con "Missing Prefab"
 en el Hierarchy de `FaceID.unity`: `CameraToWorldCameraCanvas` y `CameraToWorldButtonA_Highlight`.
-Bórralos. **Conserva** todo lo que empiece por `[BuildingBlock]`, el `Directional Light`,
-`Origin`, `Metadata` y los GameObjects de FaceID.
+Bórralos. Además, **desactiva los GameObjects de hand-tracking visual** (las manos azules):
+`[BuildingBlock] Hand Tracking left` y `[BuildingBlock] Hand Tracking right` — selecciónalos
+y desmarca el checkbox del Inspector. (Sus *anchors* — `LeftHandAnchor`, `RightHandAnchor` —
+siguen activos, así el `WristLogMenu` puede usarlos.) **Conserva** el resto: `[BuildingBlock]`s
+de cámara/passthrough, `Directional Light`, `Origin`, `Metadata` y los GameObjects de FaceID.
 
 ### 3.3. GameObjects de FaceID en la escena
 Crea estos GameObjects vacíos en la **raíz** de la escena (Hierarchy ▸ click derecho ▸ Create
@@ -75,6 +80,7 @@ Empty) y añádeles su componente (Inspector ▸ Add Component):
 | `FaceLabelManager` | `Face Label Manager` |
 | `FaceIdentifier` | `Face Identifier` |
 | `EnvironmentRaycast` | `Environment Raycast Manager` *(necesario para profundidad real del Quest)* |
+| `WristLogMenu` | `Wrist Log Menu` |
 
 Y este **obligatoriamente** (sin él, el subsistema de Occlusion de OpenXR no arranca y la
 profundidad no funciona): `GameObject ▸ XR ▸ AR Session`. Eso crea un GameObject `AR Session`
@@ -107,7 +113,7 @@ Plataforma Android, Quest conectado, **Build And Run**.
 | Flip Detection Y | activado *(si los labels salen invertidos en vertical, desactívalo)* |
 | Average Face Width Meters / Fallback / Min / Max Distance | `0.16` / `1.5` / `0.3` / `6` |
 | Min Confidence To Show | `0` |
-| Show Face Boxes / Face Box Color / Line Width | activado / verde / `0.006` |
+| Show Face Boxes / Face Box Color / Line Width | activado / cian / `0.006` |
 | Show Status Hud | activado |
 | Verbose Placement Log | desactivado *(actívalo para depurar colocación/profundidad — ver §7)* |
 | **Server Client** (desplegable) | ver §5 |
@@ -121,6 +127,17 @@ Plataforma Android, Quest conectado, **Build And Run**.
 | Label Parent | *(vacío → raíz de la escena)* |
 | Camera Transform | `CenterEyeAnchor` (en `[BuildingBlock] Camera Rig ▸ TrackingSpace`) |
 | Hide After Unseen Seconds | `2` |
+
+### `WristLogMenu`
+| Campo | Valor |
+|---|---|
+| Wrist Anchor | `LeftHandAnchor` (en `[BuildingBlock] Camera Rig ▸ TrackingSpace ▸ LeftHandAnchor`). Si prefieres la mano derecha, usa `RightHandAnchor`. |
+| Eye Anchor | `CenterEyeAnchor` *(vacío → cae a `Camera.main`)* |
+| Wrist Back Axis | `(0, 1, 0)` *(eje +Y del anchor es el dorso del controller en la rig de Meta; si te sale invertido, prueba con `(0, -1, 0)`)* |
+| Reveal Dot / Hide Dot | `0.6` / `0.45` *(histéresis del gesto "mirar la muñeca")* |
+| Panel Size Mm / Offset Mm | `(140, 180)` / `(0, 30, 0)` *(mm)* |
+| Max Entries Shown | `12` |
+| Fade Seconds | `0.18` |
 
 ---
 
@@ -161,6 +178,12 @@ ViewportPointToRay + EnvironmentRaycastManager (profundidad real)        FaceTra
   2D→3D usa la pose de ese frame.
 - La distancia usa la **profundidad real** del Quest (`EnvironmentRaycastManager`); si no hay
   raycast, cae a una estimación por el tamaño aparente de la cara.
+- **Label de "no reconocido"**: si el servidor responde con nombre vacío o confianza por debajo
+  de `Min Confidence To Show`, el panel se oculta y la cara queda solo con el bracket. Útil para
+  no llenar la vista de placeholders persistentes en caras que el server no conoce.
+- **Log de peticiones**: cada llamada a `IdentifyAsync` (sea OK, desconocido o error) se guarda
+  en `ServerRequestLog` (estática, últimas 50). El `WristLogMenu` se suscribe al evento
+  `OnEntryAdded` y se enseña al girar la muñeca hacia los ojos.
 
 ---
 
@@ -180,3 +203,8 @@ ViewportPointToRay + EnvironmentRaycastManager (profundidad real)        FaceTra
   renderiza ninguno.
 - **Va lento** → sube el `Detection Interval`, o cambia el `Backend` del detector a `CPU`/`GPUCompute`
   para ver cuál rinde mejor en tu dispositivo.
+- **El menú de la muñeca no aparece o aparece al revés** → en la rig de Meta el dorso de
+  `LeftHandAnchor` suele ser +Y, pero según el modo (controller vs hand-tracking) puede cambiar.
+  En `WristLogMenu`, prueba `Wrist Back Axis = (0, -1, 0)` o `(0, 0, 1)`; si se enseña girando
+  la palma en vez del dorso, has elegido el eje opuesto. Baja `Reveal Dot` si te cuesta
+  invocarlo (más permisivo).

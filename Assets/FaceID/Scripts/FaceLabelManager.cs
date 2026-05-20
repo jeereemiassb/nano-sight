@@ -72,17 +72,43 @@ namespace NanoSight.FaceID
         {
             m_hudMode = enabled;
             m_hudParent = parent;
-            foreach (var label in m_activeLabels.Values)
-                if (label != null) label.SetHudMode(enabled, parent);
-            foreach (var label in m_pool)
-                if (label != null) label.SetHudMode(enabled, parent);
+            ForEachLabel(l => l.SetHudMode(enabled, parent));
+        }
+
+        // ---- Runtime broadcasters used by the in-VR options menu ----
+
+        public void SetNameFontSize(float v) => ForEachLabel(l => l.NameFontSize = v);
+        public void SetDetailsFontSize(float v) => ForEachLabel(l => l.DetailsFontSize = v);
+        public void SetReferenceDistance(float v) => ForEachLabel(l => l.ReferenceDistance = v);
+        public void SetScaleByDistance(bool v) => ForEachLabel(l => l.ScaleByDistance = v);
+        public void SetPanelScale(float v) => ForEachLabel(l => l.PanelScale = v);
+
+        /// <summary>
+        /// Returns the current name font size from the prefab. Used to seed the in-VR options
+        /// menu so the slider starts at the value the labels are actually using.
+        /// </summary>
+        public float CurrentNameFontSize => m_labelPrefab != null ? m_labelPrefab.NameFontSize : 18f;
+        public float CurrentDetailsFontSize => m_labelPrefab != null ? m_labelPrefab.DetailsFontSize : 11f;
+        public float CurrentReferenceDistance => m_labelPrefab != null ? m_labelPrefab.ReferenceDistance : 1f;
+        public bool CurrentScaleByDistance => m_labelPrefab != null && m_labelPrefab.ScaleByDistance;
+        public float CurrentPanelScale => m_labelPrefab != null ? m_labelPrefab.PanelScale : 1f;
+
+        private void ForEachLabel(System.Action<FaceLabel> fn)
+        {
+            foreach (var l in m_activeLabels.Values)
+                if (l != null) fn(l);
+            foreach (var l in m_pool)
+                if (l != null) fn(l);
         }
 
         /// <summary>
         /// Shows — or updates, if it already exists — the label for <paramref name="trackId"/>.
-        /// Calling this more than once for the same id never spawns a duplicate.
+        /// Calling this more than once for the same id never spawns a duplicate. The optional
+        /// <paramref name="infoText"/> is the multi-line description the server included in its
+        /// JSON response under "info_text" — rendered verbatim under the name.
         /// </summary>
-        public void ShowLabel(int trackId, string displayName, float confidence, Vector3 worldPosition)
+        public void ShowLabel(int trackId, string displayName, float confidence,
+                              Vector3 worldPosition, string infoText = null)
         {
             if (!m_activeLabels.TryGetValue(trackId, out var label))
             {
@@ -92,7 +118,7 @@ namespace NanoSight.FaceID
             }
 
             label.SetTarget(worldPosition);
-            label.Show(displayName, confidence);
+            label.Show(displayName, confidence, infoText);
             m_lastSeenTime[trackId] = Time.time;
         }
 

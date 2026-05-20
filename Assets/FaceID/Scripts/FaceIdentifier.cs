@@ -88,11 +88,88 @@ namespace NanoSight.FaceID
         [SerializeField] private float m_maxFaceDistanceMeters = 6f;
 
         [Header("Server")]
+        [Tooltip("URL completa del endpoint de identificación. Formato esperado: " +
+                 "http://<IP-LAN>:<PUERTO>/api/oculus/identify. NO uses 127.0.0.1 ni localhost — " +
+                 "desde el Quest eso apunta al propio Quest, no a tu PC. Editable también en " +
+                 "runtime desde la pestaña SERVIDOR del menú de opciones del Quest.")]
+        [SerializeField] private string m_serverUrl = "http://192.168.1.50:8000/api/oculus/identify";
+
         [Tooltip("Identification responses below this confidence are recorded but no label is shown.")]
         [SerializeField, Range(0f, 1f)] private float m_minConfidenceToShow;
 
-        [Tooltip("Isolated HTTP client. Configure the server URL / timeout here.")]
+        [Tooltip("Padding (como fracción del bbox) añadido alrededor de la cara antes de recortar " +
+                 "para mandar al servidor. 0 = recorte ajustado al bbox; 0.5 = 50% extra por cada " +
+                 "lado. InsightFace en el servidor necesita contexto alrededor de la cara para " +
+                 "detectarla — sin padding las crops salen ~80px y el detector falla. Recomendado 0.5.")]
+        [SerializeField, Range(0f, 1.5f)] private float m_cropPaddingRatio = 0.5f;
+
+        [Tooltip("HTTP client config (timeout, image field name, verbose logging). La URL se " +
+                 "configura arriba, no aquí dentro.")]
         [SerializeField] private FaceServerClient m_serverClient = new();
+
+        /// <summary>Exposed so the in-VR settings menu can ping / re-target the server.</summary>
+        public FaceServerClient Server => m_serverClient;
+
+        /// <summary>
+        /// Whether a "…" placeholder label is shown while waiting for the server's reply on a
+        /// newly detected face. Bound to the toggle in the in-VR settings menu.
+        /// </summary>
+        public bool ShowPlaceholderWhileIdentifying
+        {
+            get => m_showPlaceholderWhileIdentifying;
+            set => m_showPlaceholderWhileIdentifying = value;
+        }
+
+        /// <summary>
+        /// Whether the top-left status chip ("BUSCANDO…" / "RECONOCIENDO · N") is visible. The
+        /// chip is built once in <see cref="SetupHud"/>; the setter just toggles its root GO so
+        /// it can be hidden / re-shown from the in-VR settings menu without restart.
+        /// </summary>
+        public bool ShowStatusHud
+        {
+            get => m_showStatusHud;
+            set
+            {
+                m_showStatusHud = value;
+                if (m_hudRoot != null) m_hudRoot.SetActive(value);
+            }
+        }
+
+        // ---- Runtime knobs exposed in the in-VR options menu ----
+
+        public bool ShowFaceBoxes
+        {
+            get => m_showFaceBoxes;
+            set
+            {
+                m_showFaceBoxes = value;
+                if (!value)
+                {
+                    // Drop every active bracket immediately. They'll be recreated on the next
+                    // detection pass once the flag is turned back on.
+                    foreach (var kv in m_markers)
+                        if (kv.Value != null) Destroy(kv.Value.gameObject);
+                    m_markers.Clear();
+                }
+            }
+        }
+        public float CropPaddingRatio
+        {
+            get => m_cropPaddingRatio;
+            set => m_cropPaddingRatio = Mathf.Clamp(value, 0f, 1.5f);
+        }
+        public float DetectionInterval
+        {
+            get => m_detectionInterval;
+            set => m_detectionInterval = Mathf.Clamp(value, 0.02f, 2f);
+        }
+        public float MinConfidenceToShow
+        {
+            get => m_minConfidenceToShow;
+            set => m_minConfidenceToShow = Mathf.Clamp01(value);
+        }
+        public FaceTracker Tracker => m_tracker;
+        public FaceLabelManager LabelManager => m_labelManager;
 
         [Header("Tracking")]
         [Tooltip("Lightweight IoU tracker that keeps face ids stable between detection passes.")]
@@ -188,6 +265,10 @@ namespace NanoSight.FaceID
                 enabled = false;
                 yield break;
             }
+
+            // Push the Inspector-configured URL into the HTTP client. AppMenu's runtime edits
+            // also go through SetServerUrl so they win over this initial value.
+            m_serverClient.SetServerUrl(m_serverUrl);
 
             // Wait until the passthrough camera is actually streaming frames.
             while (!m_cameraAccess.IsPlaying)
@@ -386,30 +467,60 @@ namespace NanoSight.FaceID
                     return;
                 }
 
+                var sw = System.Diagnostics.Stopwatch.StartNew();
                 var result = await m_serverClient.IdentifyAsync(jpeg, token);
+                sw.Stop();
+                var latencyMs = (float)sw.Elapsed.TotalMilliseconds;
 
-                if (token.IsCancellationRequested || this == null)
+                if (this == null) return;
+
+                // Cancellation almost always means the face went out of view mid-request — log it
+                // so the user has full visibility of what happened. Without this, the request
+                // silently disappears and the log looks like "nothing was tried".
+                if (token.IsCancellationRequested)
+                {
+                    ServerRequestLog.Record(new ServerRequestLog.Entry(
+                        DateTime.UtcNow, track.Id, ServerRequestLog.Status.Error,
+                        null, 0f, latencyMs, "cancelled (face lost)"));
                     return;
+                }
 
                 if (!result.Success)
                 {
                     Debug.LogWarning($"[{nameof(FaceIdentifier)}] Identification failed for track " +
                                      $"{track.Id}: {result.Error}");
+                    m_labelManager.RemoveLabel(track.Id);
+                    ServerRequestLog.Record(new ServerRequestLog.Entry(
+                        DateTime.UtcNow, track.Id, ServerRequestLog.Status.Error,
+                        null, 0f, latencyMs, result.Error));
                     return;
                 }
 
                 track.Name = result.Name;
                 track.Confidence = result.Confidence;
 
-                if (result.Confidence < m_minConfidenceToShow)
+                // Server answered but the face is unknown (empty name or low confidence): drop the
+                // placeholder so the user sees ONLY the bracket marker over unrecognised faces.
+                var isRecognised = !string.IsNullOrWhiteSpace(result.Name)
+                                   && result.Confidence >= m_minConfidenceToShow;
+                if (!isRecognised)
+                {
+                    m_labelManager.RemoveLabel(track.Id);
+                    ServerRequestLog.Record(new ServerRequestLog.Entry(
+                        DateTime.UtcNow, track.Id, ServerRequestLog.Status.Unknown,
+                        result.Name, result.Confidence, latencyMs, null));
                     return;
+                }
 
                 // The face may have been lost while we waited for the server response.
                 if (!IsTrackAlive(track.Id))
                     return;
 
                 var labelPos = GetLabelTargetPosition(track.Box);
-                m_labelManager.ShowLabel(track.Id, result.Name, result.Confidence, labelPos);
+                m_labelManager.ShowLabel(track.Id, result.Name, result.Confidence, labelPos, result.InfoText);
+                ServerRequestLog.Record(new ServerRequestLog.Entry(
+                    DateTime.UtcNow, track.Id, ServerRequestLog.Status.Recognised,
+                    result.Name, result.Confidence, latencyMs, null));
             }
             catch (Exception e)
             {
@@ -693,7 +804,10 @@ namespace NanoSight.FaceID
 
         /// <summary>
         /// Crops the region of <see cref="m_frameBuffer"/> covered by <paramref name="imageBox"/>
-        /// and encodes it as JPEG. Returns null if the crop is degenerate.
+        /// (expanded by <see cref="m_cropPaddingRatio"/> on each side) and encodes it as JPEG.
+        /// Returns null if the crop is degenerate. The padding is required by the server-side
+        /// face detector (InsightFace), which needs context around the face — a bbox-tight crop
+        /// at typical Quest distances is ~80px and the detector fails on it.
         /// </summary>
         private byte[] CropFaceJpeg(Rect imageBox)
         {
@@ -705,10 +819,18 @@ namespace NanoSight.FaceID
             var width = m_frameBuffer.width;
             var height = m_frameBuffer.height;
 
-            var px = Mathf.Clamp(Mathf.RoundToInt(viewportBox.xMin * width), 0, width - 1);
-            var py = Mathf.Clamp(Mathf.RoundToInt(viewportBox.yMin * height), 0, height - 1);
-            var pw = Mathf.Clamp(Mathf.RoundToInt(viewportBox.width * width), 1, width - px);
-            var ph = Mathf.Clamp(Mathf.RoundToInt(viewportBox.height * height), 1, height - py);
+            // Expand bbox by the configured padding ratio on every side before sampling pixels.
+            var padX = viewportBox.width * m_cropPaddingRatio;
+            var padY = viewportBox.height * m_cropPaddingRatio;
+            var expandedXMin = viewportBox.xMin - padX;
+            var expandedYMin = viewportBox.yMin - padY;
+            var expandedW = viewportBox.width + padX * 2f;
+            var expandedH = viewportBox.height + padY * 2f;
+
+            var px = Mathf.Clamp(Mathf.RoundToInt(expandedXMin * width), 0, width - 1);
+            var py = Mathf.Clamp(Mathf.RoundToInt(expandedYMin * height), 0, height - 1);
+            var pw = Mathf.Clamp(Mathf.RoundToInt(expandedW * width), 1, width - px);
+            var ph = Mathf.Clamp(Mathf.RoundToInt(expandedH * height), 1, height - py);
 
             var pixels = m_frameBuffer.GetPixels(px, py, pw, ph);
 
