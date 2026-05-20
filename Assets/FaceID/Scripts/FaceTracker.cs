@@ -48,17 +48,50 @@ namespace NanoSight.FaceID
     {
         [Tooltip("Minimum IoU between a new detection and an existing track for them to count as the same face. " +
                  "Lower = more tolerant to fast head/face motion (avoids spawning duplicate tracks).")]
-        [SerializeField, Range(0.05f, 0.9f)] private float m_iouMatchThreshold = 0.15f;
+        [SerializeField, Range(0.05f, 0.9f)] private float m_iouMatchThreshold = 0.1f;
 
         [Tooltip("How long a track survives without a matching detection before it is declared lost. " +
                  "Short value = ghost boxes from quick motion fade fast; long value = anti-flicker grace.")]
-        [SerializeField, Range(0f, 5f)] private float m_lostGraceSeconds = 0.3f;
+        [SerializeField, Range(0f, 5f)] private float m_lostGraceSeconds = 1.5f;
+
+        [Tooltip("Fallback: cuando el IoU falla (cabeza se movió y los bboxes ya no solapan), se " +
+                 "intenta matchear por DISTANCIA entre centroides. Este valor es el máximo " +
+                 "permitido en coords de viewport (0..1). 0.20 = 20% del frame: bastante " +
+                 "tolerante; 0.10 = más conservador.")]
+        [SerializeField, Range(0f, 0.5f)] private float m_centroidFallbackDistance = 0.20f;
+
+        [Tooltip("En el fallback por centroide, la detección candidata no puede ser N veces más " +
+                 "grande/pequeña que el track previo (evita confundir caras cercanas al moverse " +
+                 "muy rápido). 1.8 = la nueva detección puede ser hasta 80% más grande o pequeña.")]
+        [SerializeField, Range(1.1f, 3f)] private float m_maxSizeRatio = 1.8f;
 
         private readonly List<TrackedFace> m_tracks = new();
         private int m_nextId = 1;
 
         /// <summary>All faces currently tracked (including ones still inside their lost-grace window).</summary>
         public IReadOnlyList<TrackedFace> Tracks => m_tracks;
+
+        // Runtime-configurable tuning knobs (exposed in the in-VR options menu).
+        public float IouMatchThreshold
+        {
+            get => m_iouMatchThreshold;
+            set => m_iouMatchThreshold = Mathf.Clamp(value, 0.05f, 0.9f);
+        }
+        public float LostGraceSeconds
+        {
+            get => m_lostGraceSeconds;
+            set => m_lostGraceSeconds = Mathf.Clamp(value, 0f, 5f);
+        }
+        public float CentroidFallbackDistance
+        {
+            get => m_centroidFallbackDistance;
+            set => m_centroidFallbackDistance = Mathf.Clamp(value, 0f, 0.5f);
+        }
+        public float MaxSizeRatio
+        {
+            get => m_maxSizeRatio;
+            set => m_maxSizeRatio = Mathf.Clamp(value, 1.1f, 3f);
+        }
 
         /// <summary>Raised once, when a brand-new face starts being tracked.</summary>
         public event Action<TrackedFace> TrackCreated;
@@ -77,7 +110,7 @@ namespace NanoSight.FaceID
         {
             var detectionMatched = detections.Count > 0 ? new bool[detections.Count] : Array.Empty<bool>();
 
-            // 1. Match every existing track to its best still-unclaimed detection.
+            // 1a. PASS 1 — IoU matching. Strict, prefers boxes that physically overlap.
             foreach (var track in m_tracks)
             {
                 var bestIndex = -1;
@@ -91,6 +124,47 @@ namespace NanoSight.FaceID
                     if (iou >= bestIou)
                     {
                         bestIou = iou;
+                        bestIndex = i;
+                    }
+                }
+
+                if (bestIndex >= 0)
+                {
+                    track.Box = detections[bestIndex];
+                    track.LastSeenTime = now;
+                    detectionMatched[bestIndex] = true;
+                }
+            }
+
+            // 1b. PASS 2 — centroid-distance fallback for tracks that did NOT match by IoU.
+            // Catches the case where the head moved fast enough that the new bbox no longer
+            // overlaps the previous one, but it's clearly the same face (centroids are close +
+            // similar size). Without this fallback the user gets duplicate tracks + spurious
+            // server queries every time they look around.
+            foreach (var track in m_tracks)
+            {
+                if (Mathf.Approximately(track.LastSeenTime, now))
+                    continue; // already matched in pass 1
+
+                var trackCenter = track.Box.center;
+                var trackDiag = track.Box.size.magnitude;
+                var bestIndex = -1;
+                var bestDist = m_centroidFallbackDistance;
+                for (var i = 0; i < detections.Count; i++)
+                {
+                    if (detectionMatched[i])
+                        continue;
+
+                    var detSize = detections[i].size.magnitude;
+                    var bigger = Mathf.Max(trackDiag, detSize);
+                    var smaller = Mathf.Max(Mathf.Min(trackDiag, detSize), 1e-4f);
+                    if (bigger / smaller > m_maxSizeRatio)
+                        continue; // size mismatch — probably a different face
+
+                    var d = Vector2.Distance(trackCenter, detections[i].center);
+                    if (d <= bestDist)
+                    {
+                        bestDist = d;
                         bestIndex = i;
                     }
                 }

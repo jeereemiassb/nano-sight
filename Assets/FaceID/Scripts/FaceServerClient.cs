@@ -21,17 +21,35 @@ namespace NanoSight.FaceID
         public readonly string Name;
         public readonly float Confidence;
         public readonly string Error;
+        /// <summary>
+        /// Free-form multi-line text the server wants shown under the name in the floating panel.
+        /// The client renders it verbatim (TMP rich-text is honoured, e.g. &lt;color=...&gt;).
+        /// Each deployment composes whatever lines its DB / business logic needs — the Quest
+        /// client has zero knowledge of the underlying schema.
+        /// </summary>
+        public readonly string InfoText;
 
-        private FaceServerResult(bool success, string name, float confidence, string error)
+        /// <summary>
+        /// Derived: a face counts as recognised when the server returned a non-empty name.
+        /// No need for a separate flag in the JSON — if you got a name, you got a hit.
+        /// </summary>
+        public bool Recognised => Success && !string.IsNullOrWhiteSpace(Name);
+
+        private FaceServerResult(bool success, string name, float confidence, string error,
+                                 string infoText)
         {
             Success = success;
             Name = name;
             Confidence = confidence;
             Error = error;
+            InfoText = infoText;
         }
 
-        public static FaceServerResult Ok(string name, float confidence) => new(true, name, confidence, null);
-        public static FaceServerResult Fail(string error) => new(false, null, 0f, error);
+        public static FaceServerResult Ok(string name, float confidence, string infoText) =>
+            new(true, name, confidence, null, infoText);
+
+        public static FaceServerResult Fail(string error) =>
+            new(false, null, 0f, error, null);
     }
 
     /// <summary>
@@ -46,14 +64,18 @@ namespace NanoSight.FaceID
     [Serializable]
     public class FaceServerClient
     {
-        [Tooltip("Full URL of the identification endpoint, e.g. http://192.168.1.50:8000/identify")]
-        [SerializeField] private string m_serverUrl = "http://127.0.0.1:8000/identify";
+        // Server URL is no longer serialized here — it lives as a top-level field on
+        // FaceIdentifier so it's the first thing visible in the Inspector without expanding the
+        // "Server Client" foldout. FaceIdentifier pushes its value via SetServerUrl() on Start.
+        // Runtime edits from the AppMenu also go through SetServerUrl.
+        private string m_serverUrl = string.Empty;
 
         [Tooltip("Name of the multipart/form-data field that carries the JPEG bytes.")]
         [SerializeField] private string m_imageFieldName = "image";
 
-        [Tooltip("Request timeout in seconds. The request is aborted if the server does not answer in time.")]
-        [SerializeField, Range(1, 30)] private int m_timeoutSeconds = 5;
+        [Tooltip("Request timeout in seconds. The request is aborted if the server does not " +
+                 "answer in time. Recognition takes a few seconds on CPU — keep this generous.")]
+        [SerializeField, Range(1, 60)] private int m_timeoutSeconds = 30;
 
         [Tooltip("Log every request and response to the Unity console (useful while wiring up the server).")]
         [SerializeField] private bool m_verboseLogging;
@@ -61,15 +83,60 @@ namespace NanoSight.FaceID
         /// <summary>Configured endpoint URL (read-only, for logging / diagnostics).</summary>
         public string ServerUrl => m_serverUrl;
 
+        /// <summary>HTTP request timeout in seconds. Get/set so it can be tuned at runtime.</summary>
+        public int TimeoutSeconds
+        {
+            get => m_timeoutSeconds;
+            set => m_timeoutSeconds = Mathf.Clamp(value, 1, 60);
+        }
+
+        /// <summary>Updates the endpoint URL at runtime (e.g. from the in-VR settings menu).</summary>
+        public void SetServerUrl(string url) => m_serverUrl = url ?? string.Empty;
+
         /// <summary>
-        /// Shape of the JSON body returned by the server. Field names must match the JSON keys
-        /// exactly because <see cref="JsonUtility"/> is case-sensitive: { "name": "...", "confidence": 0.97 }.
+        /// Fires an HTTP GET against the configured <see cref="ServerUrl"/> as a reachability
+        /// probe and considers the server connected only if the response is exactly HTTP 200.
+        /// This way the SAME endpoint URL works for both the identification POST and the GET
+        /// health probe — the server-side just needs to respond 200 to GET on that path.
+        /// Stricter than a "any response = up" probe so we don't false-positive against random
+        /// 404 / 405 pages from unrelated services on the same host.
+        /// </summary>
+        public async Task<bool> HealthCheckAsync(CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrEmpty(m_serverUrl)) return false;
+
+            using var request = UnityWebRequest.Get(m_serverUrl);
+            request.timeout = m_timeoutSeconds;
+            using var cancelRegistration = cancellationToken.Register(() =>
+            {
+                if (request.result == UnityWebRequest.Result.InProgress)
+                    request.Abort();
+            });
+
+            try
+            {
+                await request.SendWebRequest();
+            }
+            catch
+            {
+                return false;
+            }
+
+            return !cancellationToken.IsCancellationRequested && request.responseCode == 200;
+        }
+
+        /// <summary>
+        /// Shape of the JSON body returned by the server. Field names match the JSON keys
+        /// exactly (<see cref="JsonUtility"/> is case-sensitive). The contract is intentionally
+        /// minimal: <c>name</c> (empty string when not recognised), <c>confidence</c>, and an
+        /// opaque <c>info_text</c> the server builds however it wants.
         /// </summary>
         [Serializable]
-        private struct ServerResponse
+        private class ServerResponse
         {
             public string name;
             public float confidence;
+            public string info_text;
         }
 
         /// <summary>
@@ -131,7 +198,7 @@ namespace NanoSight.FaceID
             try
             {
                 var parsed = JsonUtility.FromJson<ServerResponse>(json);
-                return FaceServerResult.Ok(parsed.name, parsed.confidence);
+                return FaceServerResult.Ok(parsed.name, parsed.confidence, parsed.info_text);
             }
             catch (Exception e)
             {
