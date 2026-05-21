@@ -21,6 +21,15 @@ Open the app menu with the menu button in your left controller or by tapping tog
 
 The project is designed so that face detection runs locally on the headset, while identification is handled by your own server.
 
+## Build from source
+Requires Unity 6 with Android Build Support.
+
+- Clone, open in Unity Hub
+- Wait for the Library to regenerate (first open: ~10 min)
+- File > Build Profiles > Meta Quest > Switch Platform
+- Open Assets/FaceID/Scenes/FaceID.unity
+- Build And Run with the Quest connected via USB
+
 ## Configuring the server
 
 The main setup step is the server url inside the menu options.
@@ -30,13 +39,19 @@ http://192.168.1.50:8000/identify
 ```
 
 The request is a POST multipart form upload with aface crop in the image field.
+The server can optionally include an info_text field with extra info to show under the name. The client renders it verbatim (multi-line, supports TMP rich-text like <color=#FFC857>VIP</color>), so each deployment chooses what fields to surface without touching the app.
 Expected response:
 ```json
 {
   "name": "John Doe",
-  "confidence": 0.97
+  "confidence": 0.97,
+  "info_text": "Department: Sales\nStatus: Active\nID: 12345"
 }
 ```
+
+## Server
+
+An ideal FastAPI implementation using InsightFace + FAISS is included in my last project [night-sight](https://github.com/jeereemiassb/night-sight) (local stack for face recognition).
 
 ## How it works
 
@@ -44,10 +59,20 @@ On each capture interval, NanoSight grabs a frame from the Passthrough Camera, r
 The app then places a 3D face box and a floating label using the camera pose, the face rectangle, and the Quest depth path when available.
 If the server returns an unknown face or a confidence below the display threshold, the label is hidden and only the tracking box remains visible.
 
-## Notes
+## Troubleshooting
 
-If labels or boxes appear misaligned, check the face detection flip setting.
-If the app feels slow, increase the detection interval or switch the detector backend.
+- If labels or boxes appear misaligned, check the face detection flip setting.
+- If the app feels slow, increase the detection interval or switch the detector backend.
+- "Unknown" for everyone with best=0.00: the face crops are too small for your server's detector. Increase Crop padding ratio in Options.
+- Labels misaligned: toggle Flip Detection Y.
+- Reconnect shows "no response": your server isn't returning HTTP 200 on a GET to the same URL. Add a simple GET handler that returns {"status":"ok"}.
+- Head motion creates duplicate identifications: lower IoU threshold or raise Centroid fallback distance in Options.
+
+## Credits
+
+Face detection: YuNet (MIT)
+Passthrough camera + hand tracking: Meta XR SDK
+Project scaffold: forked from Unity-PassthroughCameraApiSamples
 
 ## About
 Face recognition over AR with Meta Quest 3 glasses
